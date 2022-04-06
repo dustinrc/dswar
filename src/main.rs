@@ -1,4 +1,6 @@
-use async_std::task::{self, JoinHandle};
+use async_std::prelude::*;
+use async_std::stream;
+use async_std::task;
 use async_trait::async_trait;
 use chrono::{prelude::*, Duration};
 use clap::Clap;
@@ -181,22 +183,21 @@ async fn fetch_closing_data(
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
-    loop {
+    let mut interval = stream::interval(std::time::Duration::from_secs(opts.interval as u64));
+
+    // a simple way to output a CSV header
+    println!("period start,symbol,price,change %,min,max,30d avg");
+
+    while let Some(_) = interval.next().await {
         let to = Utc::now();
         let from: DateTime<Utc> = to - Duration::seconds(opts.interval as i64);
 
-        // a simple way to output a CSV header
-        println!("period start,symbol,price,change %,min,max,30d avg");
-        let mut tasks: Vec<JoinHandle<std::io::Result<(String, Vec<f64>)>>> = vec![];
-
-        opts.symbols
+        let tasks: Vec<_> = opts
+            .symbols
             .split(',')
             .map(|s| s.to_string())
-            .for_each(|y| {
-                tasks.push(task::spawn(async move {
-                    fetch_closing_data(&y, &from, &to).await
-                }))
-            });
+            .map(|y| task::spawn(async move { fetch_closing_data(&y, &from, &to).await }))
+            .collect();
 
         tasks.into_iter().for_each(|t| {
             task::spawn(async move {
@@ -234,13 +235,9 @@ async fn main() -> std::io::Result<()> {
                 }
             });
         });
-
-        task::block_on(async {
-            use std::time::Duration;
-            task::sleep(Duration::from_secs(opts.interval as u64)).await;
-        })
     }
-    // Ok(())
+
+    Ok(())
 }
 
 #[cfg(test)]
