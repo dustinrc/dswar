@@ -1,5 +1,6 @@
+use async_std::task::{self, JoinHandle};
 use async_trait::async_trait;
-use chrono::prelude::*;
+use chrono::{prelude::*, Duration};
 use clap::Clap;
 use std::io::{Error, ErrorKind};
 use yahoo_finance_api as yahoo;
@@ -13,8 +14,8 @@ use yahoo_finance_api as yahoo;
 struct Opts {
     #[clap(short, long, default_value = "AAPL,MSFT,UBER,GOOG")]
     symbols: String,
-    #[clap(short, long)]
-    from: String,
+    #[clap(short, long, default_value = "30")]
+    interval: u8,
 }
 
 ///
@@ -156,7 +157,7 @@ async fn fetch_closing_data(
     symbol: &str,
     beginning: &DateTime<Utc>,
     end: &DateTime<Utc>,
-) -> std::io::Result<Vec<f64>> {
+) -> std::io::Result<(String, Vec<f64>)> {
     let provider = yahoo::YahooConnector::new();
 
     let response = provider
@@ -168,50 +169,78 @@ async fn fetch_closing_data(
         .map_err(|_| Error::from(ErrorKind::InvalidData))?;
     if !quotes.is_empty() {
         quotes.sort_by_cached_key(|k| k.timestamp);
-        Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
+        Ok((
+            symbol.to_string(),
+            quotes.iter().map(|q| q.adjclose as f64).collect(),
+        ))
     } else {
-        Ok(vec![])
+        Ok((symbol.to_string(), vec![]))
     }
 }
 
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
-    let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
-    let to = Utc::now();
+    loop {
+        let to = Utc::now();
+        let from: DateTime<Utc> = to - Duration::seconds(opts.interval as i64);
 
-    // a simple way to output a CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            // min/max of the period. unwrap() because those are Option types
-            let period_max: f64 = MaxPrice::new().calculate(&closes).await.unwrap();
-            let period_min: f64 = MinPrice::new().calculate(&closes).await.unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = PriceDifference::new()
-                .calculate(&closes)
-                .await
-                .unwrap_or((0.0, 0.0));
-            let sma = WindowedSMA::new(30)
-                .calculate(&closes)
-                .await
-                .unwrap_or_default();
+        // a simple way to output a CSV header
+        println!("period start,symbol,price,change %,min,max,30d avg");
+        let mut tasks: Vec<JoinHandle<std::io::Result<(String, Vec<f64>)>>> = vec![];
 
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
+        opts.symbols
+            .split(',')
+            .map(|s| s.to_string())
+            .for_each(|y| {
+                tasks.push(task::spawn(async move {
+                    fetch_closing_data(&y, &from, &to).await
+                }))
+            });
+
+        tasks.into_iter().for_each(|t| {
+            task::spawn(async move {
+                match t.await {
+                    Ok(tsk) => {
+                        let (symbol, closes) = tsk;
+                        if !closes.is_empty() {
+                            // min/max of the period. unwrap() because those are Option types
+                            let period_max: f64 = MaxPrice::new().calculate(&closes).await.unwrap();
+                            let period_min: f64 = MinPrice::new().calculate(&closes).await.unwrap();
+                            let last_price = *closes.last().unwrap_or(&0.0);
+                            let (_, pct_change) = PriceDifference::new()
+                                .calculate(&closes)
+                                .await
+                                .unwrap_or((0.0, 0.0));
+                            let sma = WindowedSMA::new(30)
+                                .calculate(&closes)
+                                .await
+                                .unwrap_or_default();
+
+                            // a simple way to output CSV data
+                            println!(
+                                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                                from.to_rfc3339(),
+                                symbol,
+                                last_price,
+                                pct_change * 100.0,
+                                period_min,
+                                period_max,
+                                sma.last().unwrap_or(&0.0)
+                            );
+                        }
+                    }
+                    Err(e) => println!("{}", e),
+                }
+            });
+        });
+
+        task::block_on(async {
+            use std::time::Duration;
+            task::sleep(Duration::from_secs(opts.interval as u64)).await;
+        })
     }
-    Ok(())
+    // Ok(())
 }
 
 #[cfg(test)]
